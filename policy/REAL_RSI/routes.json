@@ -215,7 +215,7 @@
     "depth_provider": "mono"
   },
   "sort_nesting_dolls_by_size_random": {
-    "program": "scripts/sort_nesting_dolls_by_size",
+    "program": "scripts/sort_nesting_dolls_by_size_random",
     "action_type": "ee",
     "depth_provider": "mono"
   },
@@ -265,7 +265,7 @@
     "depth_provider": "mono"
   },
   "sweep_blocks_random": {
-    "program": "scripts/sweep_blocks",
+    "program": "scripts/sweep_blocks_random",
     "action_type": "ee",
     "depth_provider": "mono"
   }

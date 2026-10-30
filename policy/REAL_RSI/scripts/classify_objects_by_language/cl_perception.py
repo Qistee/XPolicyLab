@@ -1,8 +1,8 @@
+from real_rsi_assets import model_path as _real_rsi_model_path
 """Category classification for classify_objects_by_language.
 Fusion of (a) geometry log-likelihood from the survey size table (with depth-measurement shrink; not fitted to dev data)
 and (b) SigLIP2-base zero-shot scores on tight head-camera crops (prompt ensemble), then count-constrained assignment
 (each instruction category gets 2 or 3 instances, total = number of detections)."""
-from real_rsi_assets import model_path as _real_rsi_model_path
 import itertools, os
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -143,6 +143,9 @@ class Classifier:
         G = W_GEOM * lsm(np.array([geom_loglik(o)[ci] for o in objects]))
         S = self.crop_scores(cam, objects)
         fused = G + (lsm(S[:, ci] * TEMP) if S is not None else 0.)
+        if 'chocolate_bar' in cats:
+            heights=np.array([item['height'] for item in objects])
+            fused[:,cats.index('chocolate_bar')]-=np.clip((heights-.019)/.004,0.,2.)**2
         fused = lsm(fused)
         labels = assign(-fused)
         return [int(l) for l in labels], np.exp(fused), (('fused-' + self.dev) if S is not None else 'GEOMONLY:' + self.err)

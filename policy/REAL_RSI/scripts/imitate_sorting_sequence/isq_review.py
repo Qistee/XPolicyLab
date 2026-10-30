@@ -4,7 +4,6 @@ Inspired by the public HexaShell watch-review / route-preview interfaces, indepe
 implemented for this policy's observation and macro-command interface. Previews prove
 kinematic feasibility only, not swept-volume collision freedom.
 """
-from real_rsi_assets import model_path as _real_rsi_model_path
 import itertools
 import numpy as np
 import cv2
@@ -12,6 +11,7 @@ from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 from rgbkit.robot_mask import X5_JOINTS, BASE_XYZ, robot_mask
 from rgbkit.geometry import project
+from real_rsi_assets import model_path as _real_rsi_model_path
 
 
 class Reach:
@@ -128,25 +128,48 @@ class WatchReview:
                     same = np.mean(np.max(abs(px-ref), axis=1) < 32)
                     exposed = np.mean(np.max(abs(px-bg), axis=1) < 45)
                     if same > .55:
-                        onset = None; confirmed = None  # returned appearance cancels occlusion
+                        onset = None; confirmed = None
                     elif same < .30 and exposed > .55:
                         if onset is None: onset = step
                         if step-onset >= 15: confirmed = onset
                     elif confirmed is None:
                         onset = None
                 if confirmed is not None: found.append(confirmed)
-            if found:
-                events[idx] = min(found)
-            elif idx in strict_times:
-                # Keep original relative-height evidence, but never invent a time
-                # from object numbering or the first weak appearance change.
-                events[idx] = strict_times[idx]
-            detail.append((idx, found, strict_times.get(idx)))
-        order = sorted(events, key=events.get)
-        ambiguous = any(abs(events[a]-events[b]) < 8 for a, b in zip(order, order[1:]))
-        if len(order) != 5 or ambiguous or not home_ready:
-            return None, {'events': events, 'ambiguous': ambiguous, 'regions': detail}
-        return order, {'events': events, 'ambiguous': False, 'regions': detail}
+            # When the demonstrator has returned, its pixels should look like
+            # the initial frame again. Persistent changed pixels isolate the
+            # departed item even if a partial inventory mask included fingers.
+            # Learn each pixel's exposed-table appearance from recent RGB only.
+            temporal = None; selected = 0
+            if home_ready and len(self.frames) >= 3:
+                tail = np.stack([f[mask] for _,f in self.frames[-3:]]).astype(float)
+                final = np.median(tail,axis=0); initial = self.initial[mask].astype(float)
+                changed = np.max(abs(final-initial),axis=1)>45
+                stable = np.max(abs(tail-final),axis=(0,2))<25
+                keep = changed & stable
+                selected = int(keep.sum())
+                if selected >= max(20,.08*mask.sum()):
+                    initial,final=initial[keep],final[keep]
+                    onset=None;confirmed=None
+                    for step,frame in self.frames:
+                        px=frame[mask][keep].astype(float)
+                        same=np.mean(np.max(abs(px-initial),axis=1)<32)
+                        exposed=np.mean(np.max(abs(px-final),axis=1)<38)
+                        if same>.55:
+                            onset=None;confirmed=None
+                        elif same<.30 and exposed>.55:
+                            if onset is None:onset=step
+                            if step-onset>=15:confirmed=onset
+                        elif confirmed is None:onset=None
+                    temporal=confirmed
+            if temporal is not None:events[idx]=temporal
+            elif found:events[idx]=min(found)
+            elif idx in strict_times:events[idx]=strict_times[idx]
+            detail.append((idx, found, strict_times.get(idx), temporal, selected))
+        order=sorted(events,key=events.get)
+        ambiguous=any(abs(events[a]-events[b])<8 for a,b in zip(order,order[1:]))
+        if len(order)!=5 or ambiguous or not home_ready:
+            return None, {'events':events,'ambiguous':ambiguous,'regions':detail}
+        return order, {'events':events,'ambiguous':False,'regions':detail}
 
 
 def rgb_evidence(obs, before, obj, source, destination):
@@ -194,18 +217,43 @@ def rgb_evidence(obs, before, obj, source, destination):
     # basket/shadow pixel to look like the cargo. Existing contents cancel out.
     distinctive=(target>=.05)&(target>1.5*(background+.02))
     gain=int(distinctive[ni].sum()-distinctive[pi].sum())
+    births=int(np.count_nonzero(distinctive[ni]&~distinctive[pi]&changed))
     coverage=float(target[distinctive].sum())
     placed=True if changed.sum()>=35 and overlap>=.55 else False if changed.sum()<=5 and visibility>.65 else None
-    return dict(source_empty=empty,placed=placed,visible=len(uv),visibility=round(visibility,3),changed=int(changed.sum()),overlap=round(overlap,3),colour_gain=gain,palette_coverage=round(coverage,3))
+    return dict(source_empty=empty,placed=placed,visible=len(uv),visibility=round(visibility,3),changed=int(changed.sum()),overlap=round(overlap,3),colour_gain=gain,colour_births=births,palette_coverage=round(coverage,3))
 
 
-def incremental_delivery(evidence, object_pixels):
-    """Supplement only an unknown appearance result; caller requires two views
-    after a valid basket release and absence of an identity-matched table stray."""
-    return (evidence.get('placed') is None and evidence.get('source_empty') is True
-            and evidence.get('visibility',0)>=.65 and evidence.get('changed',0)>=60
-            and evidence.get('overlap',0)>=.25 and evidence.get('palette_coverage',0)>=.25
-            and evidence.get('colour_gain',0)>=max(35,.06*object_pixels))
+def projected_pixel_count(obs, obj, source, destination):
+    count=float(len(obj['pix']))
+    cam=obs.get('vision',{}).get('cam_head')
+    if cam is None:return count,1.
+    height=.765+.5*float(np.clip(obj.get('top',.785)-.765,.006,.08))
+    offsets=np.array([[-.01,-.01],[.01,-.01],[.01,.01],[-.01,.01]])
+    areas=[]
+    for center in (source,destination):
+        points=np.column_stack((np.asarray(center)+offsets,np.full(4,height)))
+        pixels,depth=project(cam,points)
+        if not np.isfinite(pixels).all() or np.any(depth<=.1):return count,1.
+        areas.append(float(cv2.contourArea(pixels.astype(np.float32))))
+    if min(areas)<=.01:return count,1.
+    scale=float(np.clip(areas[1]/areas[0],.25,4.))
+    return max(1.,count*scale),scale
+
+
+def incremental_delivery(evidence, object_pixels, custody=False):
+    """Two post-release views are required by caller. New target-colour pixels
+    can remain evidence when the new cargo displaced same-coloured contents;
+    accepting net loss additionally requires continuous custody through lowering.
+    """
+    observable=(evidence.get('visibility',0)>=.65 or (custody and evidence.get('visibility',0)>=.30
+                and evidence.get('visible',0)>=max(200,.20*object_pixels)))
+    if not (evidence.get('placed') is None and evidence.get('source_empty') is True
+            and observable and evidence.get('changed',0)>=60):return False
+    net=(evidence.get('overlap',0)>=.25 and evidence.get('palette_coverage',0)>=.25
+         and evidence.get('colour_gain',0)>=max(35,.06*object_pixels))
+    births=(custody and evidence.get('overlap',0)>=.08 and evidence.get('palette_coverage',0)>=.40
+            and evidence.get('colour_births',0)>=max(60,.12*object_pixels))
+    return bool(net or births)
 
 
 def capture(obs):

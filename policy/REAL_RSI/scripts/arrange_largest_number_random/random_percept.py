@@ -7,10 +7,28 @@ import alnum_percept as A
 from rgbkit import geometry as G,robot_mask
 _PALETTE=None
 _HSV=None
+_SEPARATION=None
 
 def reset_palette():
-    global _PALETTE,_HSV
-    _PALETTE=None;_HSV=None
+    global _PALETTE,_HSV,_SEPARATION
+    _PALETTE=None;_HSV=None;_SEPARATION=None
+
+def learn_background(cam,digit_mask,mat):
+    global _SEPARATION
+    if _PALETTE is None or _SEPARATION is not None:return
+    lab=cv2.cvtColor(np.asarray(cam['color'],np.uint8),cv2.COLOR_RGB2LAB).astype(float)
+    points=G.plane_map(cam,A.TABLE+.005,shape=lab.shape[:2])
+    support=np.zeros(lab.shape[:2],bool)
+    for horizontal in (np.arange(mat['n'])-(mat['n']-1)/2)*.085:
+        support|=(points[...,0]-horizontal)**2+(points[...,1]-mat['y'])**2<.028**2
+    support&=~cv2.dilate(digit_mask.astype(np.uint8),np.ones((9,9),np.uint8)).astype(bool)
+    if support.sum()<100:return
+    background=np.median(lab[support],axis=0)[1:]
+    foreground=_PALETTE[0][1:]
+    direction=foreground-background
+    distance=np.linalg.norm(direction)
+    if distance>=8:
+        _SEPARATION=(background+.55*direction,direction/distance)
 
 def color_mask(cam):
     lab=cv2.cvtColor(np.asarray(cam['color'],np.uint8),cv2.COLOR_RGB2LAB).astype(float)
@@ -19,7 +37,11 @@ def color_mask(cam):
     if _HSV is not None:
         hsv=cv2.cvtColor(np.asarray(cam['color'],np.uint8),cv2.COLOR_RGB2HSV).astype(float)
         hue,sat,val=_HSV;dh=abs(hsv[...,0]-hue);dh=np.minimum(dh,180-dh)
-        return (dh<15)&(hsv[...,1]>max(45,sat-40))&(hsv[...,2]>max(20,val-30))
+        selected=(dh<15)&(hsv[...,1]>max(45,sat-40))&(hsv[...,2]>max(20,val-30))
+        if _SEPARATION is not None:
+            midpoint,direction=_SEPARATION
+            selected&=((lab[...,1:]-midpoint)*direction).sum(2)>0
+        return selected
     return ((((lab-c)*[.45,1,1])**2).sum(2)<28**2)&(lab[...,0]<hi[0]+5)&(lab[...,0]>lo[0]-25)
 
 def normalized(mask):
@@ -133,5 +155,7 @@ def diagnose(cam,state=None,sink=0.):
         if not len(ids):continue
         i=int(np.bincount(ids).argmax());x,y,w,h,area=map(int,stats[i]);t={k:v for k,v in t.items() if k not in ('mask','lab')}
         t.update(component=i,bbox=[x,y,w,h],area=area,center=centers[i].tolist());tiles.append(t)
-    result=dict(n=len(tiles),tiles=tiles,mat_hypotheses=mat_row(cam),rejected_components=[],elapsed_s=time.monotonic()-start,sink_m=sink,quality_pass=False,proposal_count=len(proposals))
+    mats=mat_row(cam)
+    if _PALETTE is not None and mats and mats[0]['n']==len(tiles):learn_background(cam,mask,mats[0])
+    result=dict(n=len(tiles),tiles=tiles,mat_hypotheses=mats,rejected_components=[],elapsed_s=time.monotonic()-start,sink_m=sink,quality_pass=False,proposal_count=len(proposals))
     return result,mask,rm

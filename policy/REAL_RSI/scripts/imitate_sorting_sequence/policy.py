@@ -4,8 +4,10 @@ import itertools
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 import isq_servo
-from isq_review import Reach, Appearance, WatchReview, rgb_evidence, capture, wrist_payload, refresh_destination_reference, incremental_delivery
+from isq_review import Reach, Appearance, WatchReview, rgb_evidence, capture, wrist_payload, refresh_destination_reference, incremental_delivery, projected_pixel_count
 from isq_scene import components,scene,pix_mask,lab_diff,basket_mask,TABLE,franka_template
+from isq_temporal_inventory import back_options,needs_review,repair_inventory
+from isq_basket_volume import volume_change,persistent_volume
 
 BASKET0=((-.495,-.305),(-.295,-.005))   # ee xy over the basket0 footprint (0.20 x 0.30 at (-.40,-.15))
 
@@ -75,7 +77,7 @@ class Policy:
         def groups(k,m):
             objs=[]
             for o in components(obs,self.table,kernel=k,merge=m):
-                if len(o['points'])<60 or o['top']>=self.table+.105 or min(o['dims'])>=.095:continue
+                if len(o['points'])<80 or o['top']>=self.table+.105 or min(o['dims'])>=.095:continue
                 if max(o['dims'])>=.15:
                     # two touching objects merged (RGB shadows/edges): split along the long axis
                     parts=split2(o) if max(o['dims'])<.24 else None
@@ -119,6 +121,7 @@ class Policy:
                 if parts is None:break
                 grp.pop(k);grp+=parts
             grp=sorted(grp,key=lambda o:o['xy'][0]);out.append(grp);note.append('%sfallback%d'%('fb'[g],len(grp)))
+        self.back_options=back_options(res)
         return out[0],out[1],','.join(note)
     def cmd(self,targets,n,phase):
         self.t+=n
@@ -155,6 +158,8 @@ class Policy:
             xy=cells[np.argmax(scores)]
         if h<.045 and o['dims'][1]/max(.005,o['dims'][0])>1.55:
             xy=o['xy'].copy()
+        if rg is not None and min(o['dims'])<.080:
+            xy=o['xy'].copy();rg=None;self.grasp_kind='watch_body'
         rad=xy-np.asarray(o['xy'],float)
         if rg is not None and np.linalg.norm(rad)>.008:
             # Watch lying flat: pinch the case/band wall at the dense patch with the closing axis RADIAL
@@ -183,12 +188,30 @@ class Policy:
         if not candidates:return None
         best=min(candidates,key=cost)
         return best if cost(best)<1.5 else None
+    def stationary_fragment(self,obs,c):
+        """A partial, unchanged robot-adjacent patch is not newly dropped cargo.
+
+        Keep genuine source reacquisition and unknown/occluded cases available.
+        This rejects a positive stray only on sufficient unchanged RGB evidence.
+        """
+        if not c.get('partial') or not hasattr(self,'before_transfer'):return False
+        if np.linalg.norm(c['xy']-self.source)<.07:return False
+        from rgbkit.robot_mask import robot_mask
+        old,old_mask=self.before_transfer
+        cam=obs['vision']['cam_head'];rgb=np.asarray(cam['color'])[...,:3]
+        blocked=old_mask|robot_mask(cam,obs['state'],rgb.shape[:2],dilate=3)
+        pix=c['pix'];visible=pix[~blocked.ravel()[pix]]
+        if len(visible)<max(30,.35*len(pix)):return False
+        diff=np.max(abs(rgb.reshape(-1,3)[visible].astype(float)-old.reshape(-1,3)[visible]),axis=1)
+        return bool(np.mean(diff<28)>.70)
+
     def find_stray(self,obs):
         """Current object lying on the table outside basket0 (not owned by another undelivered object)."""
         ref=self.obj
         others=[self.front[self.match[i]] for i in self.order[self.index+1:]]
         best=None
         for c in components(obs,self.table):
+            if self.stationary_fragment(obs,c):continue
             x,y=c['xy']
             if -.495<x<-.305 and -.295<y<-.005:continue   # basket interior, not surrounding table
             if not(-.40<y<.085 and -.45<x<.45):continue
@@ -203,6 +226,7 @@ class Policy:
         if 'embedding' not in canonical:return None
         candidates=[]
         for c in components(obs,self.table):
+            if self.stationary_fragment(obs,c):continue
             x,y=c['xy']
             if not(-.45<x<.45 and -.40<y<.085):continue
             if -.495<x<-.305 and -.295<y<-.005:continue
@@ -253,10 +277,11 @@ class Policy:
             rot=Rotation.from_quat(q[[1,2,3,0]])*Rotation.from_euler('y',tilt,degrees=True)
             qq=rot.as_quat()[[3,0,1,2]]
             gp=pin-rot.apply([.139,0,0])
-            rz=gp[2]+.015 if relay else self.table+.139+(.06 if self.grasp_kind=='ring' else .105+(self.index%2)*.016)
+            destination_xy=np.asarray(dest)+gp[:2]-o['xy']
+            rz=gp[2]+.015 if relay else self.table-rot.apply([.139,0,0])[2]+(.06 if self.grasp_kind=='ring' else .105+(self.index%2)*.016)
             pre=max(gp[2]+.03,o['top']+.139+.025)
             poses=[np.r_[gp[:2],high,qq],np.r_[gp[:2],pre,qq],np.r_[gp,qq],np.r_[gp[:2],high,qq],
-                   np.r_[dest,high,qq],np.r_[dest,rz,qq],np.r_[dest,high,qq]]
+                   np.r_[destination_xy,high,qq],np.r_[destination_xy,rz,qq],np.r_[destination_xy,high,qq]]
             if self.reach.route(arm,poses,obs['state']):return gp,qq,tilt
         return None
     def transfer(self,obs,o,arm,dest,relay=False):
@@ -272,12 +297,22 @@ class Policy:
             self.stage='done';self.queue=[];self.diag='preflight-no-route arm='+arm
             self.queue.append(({},1,self.diag));return
         self.grasp_pose,q,self.route_tilt=plan;self.q=q
-        self.before_transfer=capture(obs);self.verify_wait=0;self.incremental_hits=0;self.pick_check=None
+        self.placement_offset=self.grasp_pose[:2]-o['xy']
+        destination_xy=np.asarray(dest)+self.placement_offset
+        self.before_transfer=capture(obs);self.verify_wait=0;self.incremental_hits=0;self.pick_check=None;self.custody_lower=False
+        self.volume_details=[];self.volume_masks=[]
         self.last=None;self.close_gap=None;self.lower_ok=False;self.settled=False;self.settle_frames=0
         grasp=self.grasp_pose;high=self.table+.32
         name='obj%d:%s:try%d%s'%(self.index,arm,self.attempt,getattr(self,'grasp_kind','')[:1])
         yaw0=float(Rotation.from_quat(np.asarray(q)[[1,2,3,0]]).as_euler('zyx')[0])
         self.diag=(self.diag if self.diag.startswith(('relay','no clear','reach','stray')) else '')+' src=%s grasp=%s yaw=%.2f dest=%s relay=%d'%(np.round(o['xy'],3).tolist(),np.round(grasp,3).tolist(),yaw0,np.round(dest,3).tolist(),int(relay))
+        self.diag+=' center-offset='+str(np.round(self.placement_offset,4).tolist())
+        self.reference_clear=None if relay else self.basket_clear_pose(obs)
+        if self.reference_clear is not None:
+            current=np.asarray(obs['state'][arm+'_ee_pose'])
+            rotation_error=Rotation.from_quat(current[[4,5,6,3]]).inv()*Rotation.from_quat(self.reference_clear[[4,5,6,3]])
+            if np.linalg.norm(current[:3]-self.reference_clear[:3])>.012 or rotation_error.magnitude()>.10:
+                self.queue.append(({arm+'_ee_pose':self.reference_clear,arm+'_ee_joint_state':[1]},12,name+':reference'))
         self.add(arm,np.r_[grasp[:2],high],q,1,(12 if arm=='left' and self.parked else 16),name+':approach')
         pre=max(grasp[2]+.03,o['top']+.139+.025)
         self.add(arm,np.r_[grasp[:2],pre],q,1,5,name+':pregrasp')
@@ -285,27 +320,23 @@ class Policy:
         slender=(o['top']-self.table<.06 and max(o['dims'])>1.5*max(.01,min(o['dims'])))
         self.add(arm,grasp,q,0,12 if slender else 8,name+':close')
         self.add(arm,np.r_[grasp[:2],high],q,0,24 if slender else 18,name+':lift')
-        carry_frames=int(np.clip(np.ceil(12+20*np.linalg.norm(dest-grasp[:2])),18,28))
+        carry_frames=int(np.clip(np.ceil(12+20*np.linalg.norm(destination_xy-grasp[:2])),18,28))
         if slender:
-            middle=(grasp[:2]+dest)*.5
+            middle=(grasp[:2]+destination_xy)*.5
             self.add(arm,np.r_[middle,high],q,0,18,name+':carry')
-            self.add(arm,np.r_[dest,high],q,0,18,name+':carry')
-        else:self.add(arm,np.r_[dest,high],q,0,carry_frames,name+':carry')
+            self.add(arm,np.r_[destination_xy,high],q,0,18,name+':carry')
+        else:self.add(arm,np.r_[destination_xy,high],q,0,carry_frames,name+':carry')
         ringgrip=getattr(self,'grasp_kind','')=='ring'
-        releasez=grasp[2]+.015 if relay else self.table+.139+(.06 if ringgrip else .105+(self.index%2)*.016)
-        self.add(arm,np.r_[dest,releasez],q,0,(14 if ringgrip and not relay else 10),name+':lower')
-        self.add(arm,np.r_[dest,releasez],q,1,10,name+':release')
+        releasez=grasp[2]+.015 if relay else self.table-Rotation.from_quat(q[[1,2,3,0]]).apply([.139,0,0])[2]+(.06 if ringgrip else .105+(self.index%2)*.016)
+        self.add(arm,np.r_[destination_xy,releasez],q,0,(14 if ringgrip and not relay else 10),name+':lower')
+        self.add(arm,np.r_[destination_xy,releasez],q,1,10,name+':release')
         if ringgrip:
             # Rings can wedge on the inner finger: rise slowly in two steps so the band slides off.
-            self.add(arm,np.r_[dest,releasez+.04],q,1,6,name+':unhook')
-        self.add(arm,np.r_[dest,high],q,1,6,name+':retreat')
-        next_right=self.index<4 and self.prefer_right(self.front[self.match[self.order[self.index+1]]])
-        if arm=='left' and not relay and self.index<4 and not next_right:
-            # Clear the camera and basket at height without descending/rotating home.
-            self.add(arm,np.array([-.29,-.30,high]),q,1,6,name+':park')
-            self.parked=True
-        elif self.index==4 and not relay and self.t+sum(x[1] for x in self.queue)+16+25>1598:
-            pass   # budget guard: rungs need open grippers, not homing; the final-home step moves both arms
+            self.add(arm,np.r_[destination_xy,releasez+.04],q,1,6,name+':unhook')
+        self.add(arm,np.r_[destination_xy,high],q,1,6,name+':retreat')
+        if self.reference_clear is not None:
+            self.queue.append(({arm+'_ee_pose':self.reference_clear,arm+'_ee_joint_state':[1]},12,name+':clear'))
+            self.parked=False
         else:
             self.queue.append(({arm+'_ee_pose':self.home[arm],arm+'_ee_joint_state':[1]},(12 if arm=='left' and self.index<4 else 16),name+':home'))
             if arm=='left':self.parked=False
@@ -403,7 +434,7 @@ class Policy:
             r=Rotation.from_euler('z',yaw)*Rotation.from_quat(TOP[[1,2,3,0]]);q=r.as_quat()[[3,0,1,2]]
         self.diag='wrist-shift %.3f from=%s to=%s yaw=%s n=%d'%(shift,np.round(g[:2],3).tolist(),np.round(new,3).tolist(),'-' if yaw is None else '%.2f'%yaw,res['n'])
         g[:2]=new
-        candidate_poses=[np.r_[new,self.table+.32,q],np.r_[g,q],np.r_[self.dest,self.table+.32,q]]
+        candidate_poses=[np.r_[new,self.table+.32,q],np.r_[g,q],np.r_[self.dest+self.placement_offset,self.table+.32,q]]
         if not self.reach.route(self.arm,candidate_poses,obs['state']):
             self.diag+=' wrist-preflight-reject';return None
         self.grasp_pose=g;self.q=q
@@ -436,6 +467,9 @@ class Policy:
         if self.last is not None:
             label,target=self.last;self.last=None
             ee=np.asarray(obs['state'][self.arm+'_ee_pose']);gap=float(obs['state'][self.arm+'_ee_joint_state'][0])
+            if label.endswith(':reference'):
+                self.before_transfer=capture(obs)
+                self.diag='paired-clear-reference '+self.diag
             if label.endswith((':approach',':contact',':close',':lift')):
                 self.before_transfer=refresh_destination_reference(obs,self.before_transfer,self.dest)
             if label.endswith(':approach'):
@@ -463,7 +497,7 @@ class Policy:
                         # A slip into the receiving basket is a possible delivery,
                         # not a reason to search an empty source. Release remaining
                         # contact at the reached pose, retreat, then verify again.
-                        self.release_xy=ee[:2].copy();self.lower_ok=True
+                        self.release_xy=ee[:2]-getattr(self,'placement_offset',np.zeros(2));self.lower_ok=True
                         self.queue=[];self.last=None;self.verify_wait=0
                         self.add(self.arm,ee[:3],ee[3:],1,8,'landed-open '+str(self.pick_check))
                         clear=self.basket_clear_pose(obs)
@@ -472,7 +506,12 @@ class Policy:
                     else:
                         return self.recover(obs,'lost-aperture '+self.diag)
             if label.endswith(':lower'):
-                self.release_xy=ee[:2].copy()
+                self.release_xy=ee[:2]-getattr(self,'placement_offset',np.zeros(2))
+                self.lower_error=float(np.linalg.norm(ee[:3]-np.asarray(target[self.arm+'_ee_pose'])[:3]))
+                self.custody_lower=bool(not self.is_relay and gap>=max(.04,.60*(self.close_gap or 0.))
+                    and (self.pick_check or {}).get('source_empty') is True
+                    and self.lower_error<.018)
+                self.diag+=' lower-error=%.4f custody=%d'%(self.lower_error,int(self.custody_lower))
                 if gap<.015 and not ((self.pick_check or {}).get('source_empty') and (self.pick_check or {}).get('wrist_held')):
                     if self.is_relay:
                         self.diag='relay-lower-empty gap=%.3f'%gap
@@ -553,10 +592,20 @@ class Policy:
                 return self.act(obs)
             if not good:return self.halt('basket arrival unverified release=%s lower_ok=%d'%(None if rx is None else np.round(rx,3).tolist(),int(self.lower_ok)))
             evidence=rgb_evidence(obs,self.before_transfer,self.obj,self.source,self.dest)
-            supplemental=incremental_delivery(evidence,len(self.obj['pix']))
+            expected_pixels,area_scale=projected_pixel_count(obs,self.obj,self.source,self.dest)
+            evidence.update(source_pixels=len(self.obj['pix']),expected_pixels=round(expected_pixels,1),area_scale=round(area_scale,3),custody=bool(getattr(self,'custody_lower',False)))
+            supplemental=incremental_delivery(evidence,expected_pixels,getattr(self,'custody_lower',False))
             self.incremental_hits=(getattr(self,'incremental_hits',0)+1) if supplemental else 0
             if self.incremental_hits>=2:
-                evidence['placed']=True;evidence['confirmation']='persistent-incremental-colour'
+                evidence['placed']=True;evidence['confirmation']='persistent-colour-births-with-custody' if getattr(self,'custody_lower',False) and evidence.get('colour_gain',0)<max(35,.06*expected_pixels) else 'persistent-incremental-colour'
+            if evidence['placed'] is not True:
+                if self.index<4:
+                    detail,mask=volume_change(obs,self.before_transfer)
+                    self.volume_details.append(detail);self.volume_masks.append(mask)
+                    supported,persistent=persistent_volume(evidence,self.volume_details,self.volume_masks,expected_pixels,getattr(self,'custody_lower',False))
+                    evidence.update(basket_volume=detail,persistent_pixels=persistent)
+                    if self.verify_wait>=2 and supported:
+                        evidence['placed']=True;evidence['confirmation']='persistent-basket-volume-with-custody'
             if evidence['placed'] is not True:
                 # Inspection costs 12 frames. Reserve it separately from the
                 # conservative transfer budget so a completed drop can be checked.
@@ -571,6 +620,10 @@ class Policy:
                 left=self.find_object(obs,self.obj,self.source,.12)
                 if left is not None and self.attempt<3 and self.t+110+self.remaining_cost()<1599:
                     self.attempt+=1;self.transfer(obs,left,self.arm,self.dest,False);return self.act(obs)
+                if self.index==4:
+                    self.stage='done';self.queue=[];self.last=None
+                    return self.cmd({arm+'_ee_pose':pose for arm,pose in self.home.items()}|{arm+'_ee_joint_state':[1] for arm in self.home},
+                                    int(np.clip(1599-self.t,1,25)),'final-home-uncertain '+str(evidence))
                 return self.halt('basket-visual-unconfirmed '+str(evidence))
             self.delivery_checks.append(evidence)
             self.delivered.append(self.obj);self.index+=1;self.attempt=0;self.stage='next'
@@ -581,6 +634,21 @@ class Policy:
             if home_ready or self.t>=584:
                 reviewed,info=self.watch_review.resolve(self.strict_times,home_ready)
             else:reviewed,info=None,{}
+            if home_ready and needs_review(reviewed,info,self.match_margin):
+                replacement=None
+                if self.t-getattr(self,'inventory_review_at',-100)>=24:
+                    self.inventory_review_at=self.t
+                    replacement=repair_inventory(self,desc)
+                if replacement is not None:
+                    info=replacement['detail'];info['previous_strict']=dict(self.strict_times)
+                    self.back=replacement['objects'];self.watch_review=replacement['review']
+                    self.match=replacement['match'];self.costs=replacement['costs'];self.match_margin=replacement['margin']
+                    self.inv_note+=' temporal-repair='+replacement['name']
+                    if replacement['features'] is not None:
+                        for obj,feature in zip(self.back+self.front,replacement['features']):obj['embedding']=feature
+                    reviewed=replacement['order']
+                else:
+                    reviewed=None;info=dict(info,inventory_repair='unresolved')
             if reviewed is None:
                 if self.t>=648:
                     return self.halt('watch-unresolved '+str(info))
@@ -594,7 +662,15 @@ class Policy:
                 self.stage='done';return self.cmd({a+'_ee_pose':p for a,p in self.home.items()}|{a+'_ee_joint_state':[1] for a in self.home},int(np.clip(1599-self.t,1,25)),'final-home')
             o=self.front[self.match[self.order[self.index]]]
             fresh=self.find_object(obs,o,o['xy'],.075)
-            if fresh is not None:o=fresh
+            if fresh is not None:
+                # Before its first pick a stationary object keeps the initial
+                # rest height. Moving arms/shadows can double mono height even
+                # though its RGB footprint has not moved. Bound only upward
+                # drift; relay and dropped-object recovery are not constrained.
+                size_ratio=max(fresh['dims'])/max(.01,max(o['dims']))
+                if np.linalg.norm(fresh['xy']-o['xy'])<.035 and .70<size_ratio<1.35:
+                    fresh=dict(fresh);fresh['top']=min(fresh['top'],o['top']+.006)
+                o=fresh
             self.obj=o;self.attempt=0;self.switched=False
             if self.prefer_right(o):
                 site,clearance=self.relay_site(obs,o)
@@ -611,10 +687,14 @@ class Policy:
             return self.act(obs)
         return {'op':'stop'}
     def landed_at_destination(self,ee,evidence):
+        center=ee[:2]-getattr(self,'placement_offset',np.zeros(2))
+        possible=(evidence.get('placed') is True or
+                  (evidence.get('placed') is None and evidence.get('changed',0)>=60
+                   and evidence.get('visibility',0)>=.30))
         return (not self.is_relay and evidence.get('source_empty') is True
-                and evidence.get('placed') is True
-                and BASKET0[0][0]+.02<float(ee[0])<BASKET0[0][1]-.02
-                and BASKET0[1][0]+.02<float(ee[1])<BASKET0[1][1]-.02)
+                and possible
+                and BASKET0[0][0]+.02<float(center[0])<BASKET0[0][1]-.02
+                and BASKET0[1][0]+.02<float(center[1])<BASKET0[1][1]-.02)
     def basket_clear_pose(self,obs):
         # Rank reachable poses by projected basket occlusion, using hypothetical
         # joint FK only. Returning home is not assumed to clear the basket.

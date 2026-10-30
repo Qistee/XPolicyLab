@@ -53,7 +53,7 @@ def plane_xy(K, T, shape, z):
     return xy
 
 
-def locate(obs, arm, expect, category, radius=.06):
+def locate(obs, arm, expect, category, radius=.06, prefer_expected=False):
     """-> dict(center, yaw (closing direction), length, width, n, xy) or None."""
     cam = obs['vision'].get(f'cam_{arm}_wrist')
     if cam is None: return None
@@ -90,11 +90,11 @@ def locate(obs, arm, expect, category, radius=.06):
     yaw = float(np.arctan2(minor[1], minor[0])); yaw = (yaw + np.pi / 2) % np.pi - np.pi / 2
     out = dict(center=center, yaw=yaw, length=float(hi[0] - lo[0]), width=float(hi[1] - lo[1]), n=len(pts), xy=pts)
     if category == 'watch':
-        out.update(ring_target(pts, center))
+        out.update(ring_target(pts, center, np.asarray(expect)[:2] if prefer_expected else None))
     return out
 
 
-def ring_target(pts, c):
+def ring_target(pts, c, anchor=None):
     """Point on the ring band with the most material; close radially across the band."""
     rel = pts - c; r = np.linalg.norm(rel, axis=1); ang = np.arctan2(rel[:, 1], rel[:, 0])
     best = None
@@ -103,7 +103,8 @@ def ring_target(pts, c):
         if sec.sum() < 10: continue
         rk = np.median(r[sec]); p = c + rk * np.array([np.cos(a), np.sin(a)])
         cnt = int(np.sum(np.linalg.norm(pts - p, axis=1) < .009))
-        if best is None or cnt > best[0]: best = (cnt, p, a)
+        score = cnt if anchor is None else cnt * np.exp(-np.linalg.norm(p - anchor) / .012)
+        if best is None or score > best[0]: best = (score, p, a)
     if best is None: return {}
     yaw = (best[2] + np.pi / 2) % np.pi - np.pi / 2
     return dict(ring_point=best[1], ring_yaw=float(yaw))

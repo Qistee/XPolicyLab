@@ -309,6 +309,19 @@ def _feat(p, mk):
     if len(patch) > 2:
         _, ax = np.linalg.eigh(np.cov(patch.T)); ga = float(np.arctan2(ax[1, -1], ax[0, -1]))
     else: ga = float(np.arctan2(axis[1], axis[0]))
+    watch_grasps = [[float(grip[0]), float(grip[1]), ga]]
+    for candidate in np.argsort(score)[::-1]:
+        if any(np.linalg.norm(xy[candidate] - np.asarray(previous[:2])) < .016 for previous in watch_grasps):
+            continue
+        local_patch = xy[np.linalg.norm(xy - xy[candidate], axis=1) < .009]
+        if len(local_patch) < 3:
+            continue
+        local_center = np.median(local_patch, axis=0)
+        _, local_axes = np.linalg.eigh(np.cov(local_patch.T))
+        local_angle = float(np.arctan2(local_axes[1, -1], local_axes[0, -1]))
+        watch_grasps.append([float(local_center[0]), float(local_center[1]), local_angle])
+        if len(watch_grasps) >= 3:
+            break
     vs, us = np.nonzero(mk)
     L, W = float(dims[1]), float(dims[0])
     return dict(x=float(fc[0]), y=float(fc[1]), mx=float(center[0]), my=float(center[1]), height=height, length=L, width=W,
@@ -316,7 +329,7 @@ def _feat(p, mk):
                 bright=float(np.mean(mx)), dark=float(np.mean(mx < .30)), brown=brown, hue=hue,
                 gx=float(grip[0]), gy=float(grip[1]), ga=ga, cx=float(fc[0]), cy=float(fc[1]), ch=.035,
                 body_ok=bool(.055 < L < .145 and .022 < W < .07),
-                pixels=int(mk.sum()), bbox=(int(us.min()), int(vs.min()), int(us.max()) + 1, int(vs.max()) + 1))
+                watch_grasps=watch_grasps, pixels=int(mk.sum()), bbox=(int(us.min()), int(vs.min()), int(us.max()) + 1, int(vs.max()) + 1))
 
 
 def _split2(p, mk, shape):

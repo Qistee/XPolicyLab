@@ -17,11 +17,14 @@ import traceback
 import cl_servo
 from cl_scene import detect
 
-GEOK=('x','y','angle','height','gx','gy','ga','cx','cy','ch','body_ok')
+GEOK=('x','y','angle','height','gx','gy','ga','cx','cy','ch','body_ok','watch_grasps')
 GRIP_LOST=.02      # gripper joint after close below this = nothing held (sibling classify_objects)
 GRIP_DROP=.4       # below 40% of the post-close aperture = dropped
 # category constants (survey size table; est depth heights are compressed 0.64-0.88x -> never used for grasp heights)
 CAT_H={'car':.035,'watch':.025,'wooden_toy':.065,'pepper':.062,'chocolate_bar':.012}
+
+def grip_minimum(item):
+    return .008 if item.get('cat')=='watch' else GRIP_LOST
 
 def rot(q):
     return Rotation.from_quat([*q[1:],q[0]]).as_matrix()
@@ -54,8 +57,19 @@ class Policy:
         b=self.mapping.get(o['cat'],1)
         return (a=='left' and b==2) or (a=='right' and b==0)
     def relay_admissible(self,o,a):
+        token=o.get('relay_in')
+        if token and self.relays[token]['state']=='ready':return True
         return not self.requires_relay(o,a) or (not self.relays_disabled and self.occupied_relay() is None)
-    def reserve_relay(self,donor,receiver,arm):
+    def reserve_relay(self,donor,receiver,arm,reuse_token=None):
+        if reuse_token:
+            r=self.relays[reuse_token]
+            if r is not self.occupied_relay() or r['state']!='ready':
+                raise RuntimeError('restage requires the existing ready reservation')
+            r.update(donor=arm,clear_arm=arm,receiver=receiver,slot=(receiver['x'],receiver['y']),
+                     state='reserved',transit_ok=False,lift_ok=False,restages=r.get('restages',0)+1)
+            donor['relay_out']=reuse_token;receiver['relay_in']=reuse_token;receiver['ready']=False
+            self.relay_event('restage',r,'drifted_to_donor_side')
+            return reuse_token
         if self.occupied_relay() is not None or self.relays_disabled:
             raise RuntimeError('relay capacity already occupied')
         self.relay_serial+=1;token=f'r{self.relay_serial}'
@@ -107,7 +121,7 @@ class Policy:
                 a=r['receiver_arm'];pose=np.asarray(obs['state'][a+'_ee_pose'])
                 tcp=pose[:3]+rot(pose[3:])@np.array([.145,0,0])
                 grip=float(np.asarray(obs['state'][a+'_ee_joint_state']).flat[0])
-                if grip>=GRIP_LOST and grip>=GRIP_DROP*r['lift_grip'] and np.linalg.norm(tcp[:2]-r['slot'])>.075:
+                if grip>=grip_minimum(r['receiver']) and grip>=GRIP_DROP*r['lift_grip'] and np.linalg.norm(tcp[:2]-r['slot'])>.075:
                     r['state']='consumed';self.relay_event('consume',r,'held_and_clear')
             if r['state'] not in ('released','recovering'):continue
             a=r['clear_arm']
@@ -248,7 +262,7 @@ class Policy:
         return any(not o.get('taken') and not o.get('skip') and self.assign_arm(o)==a for o in self.items)
     def act_dual(self,obs):
         self.mode='dual'
-        if self.used>1015 and not self.cutoff:
+        if self.used>1040 and not self.cutoff:
             self.cutoff=True
             self.cancel_relays(None,'cutoff')
             for o in self.items:o['taken']=True
@@ -330,7 +344,7 @@ class Policy:
     def control(self,obs):
         if not hasattr(self,'active'): self.active=None;self.used=0
         if not hasattr(self,'used'):self.used=0
-        if self.mode=='global' and self.used>1015 and not self.done:
+        if self.mode=='global' and self.used>1040 and not self.done:
             self.cancel_relays(None,'global_cutoff')
             self.active=None;self.queue=[];self.index=len(self.items)
         if self.active is None:
@@ -355,7 +369,10 @@ class Policy:
             maxd=max(maxd,dist);maxang=max(maxang,angle)
             loaded=cmd['targets'].get(key.replace('_ee_pose','_ee_joint_state'),[1.])[0]==0.
             careful=loaded and any(v in cmd.get('phase','') for v in ('lift','rotate','lower','close'))
-            fraction=min(1.,(.04 if careful else .06)/max(dist,1e-6),(.35 if loaded else .40)/max(angle,1e-6))
+            car_loaded=loaded and getattr(self,'current',None) is not None and self.current.get('cat')=='car'
+            linear_step=.025 if car_loaded else (.04 if careful else .06)
+            angular_step=.20 if car_loaded else (.35 if loaded else .40)
+            fraction=min(1.,linear_step/max(dist,1e-6),angular_step/max(angle,1e-6))
             q=qa*(1-fraction)+qb*fraction;q/=np.linalg.norm(q)
             targets[key]=np.r_[actual[:3]+fraction*delta,q].tolist()
         if cmd.get('pivot'):
@@ -412,7 +429,7 @@ class Policy:
             grip_dwell=any(t in phase for t in ('close','release'))
             if not grip_dwell and '_cat0_' not in phase and maxd<.004 and maxang<.035:
                 return {'advance':True}
-            frames=10 if grip_dwell else 3
+            frames=12 if grip_dwell else 3
         else:frames=3
         if self.phase_label is None:self.phase_label=phase+f'_start{maxd:.3f}m_{maxang*180/np.pi:.0f}deg'
         label=self.phase_label if self.active is not None else phase+f'_end{maxd:.3f}m_{maxang*180/np.pi:.0f}deg'
@@ -442,9 +459,9 @@ class Policy:
                 grip=float(np.asarray(obs['state'][self.arm+'_ee_joint_state']).flat[0])
                 if stage=='lift':
                     self.current['post_close']=grip
-                    if grip<GRIP_LOST:self.current['empty']=self.current.get('empty',0)+1
+                    if grip<grip_minimum(self.current):self.current['empty']=self.current.get('empty',0)+1
                 post=self.current.get('post_close',grip)
-                held=grip>=GRIP_LOST and grip>=GRIP_DROP*post
+                held=grip>=grip_minimum(self.current) and grip>=GRIP_DROP*post
                 label=f'payload_{stage}_id{self.current["uid"]}_g{grip:.3f}_post{post:.3f}_held{int(held)}'
                 self.payload_n=0
                 token=self.current.get('relay_out')
@@ -542,7 +559,7 @@ class Policy:
         lower/close/lift (and pivot) commands. Re-hover if the correction is > 1.5 cm or 20 deg (max 2 looks)."""
         a=self.arm;o=self.current;cat=o['cat'];x0,y0,yaw0,q0=cmd['x'],cmd['y'],cmd['yaw'],cmd['q']
         r=None;note='none'
-        try:r=cl_servo.locate(obs,a,[x0,y0],cat)
+        try:r=cl_servo.locate(obs,a,[x0,y0],cat,prefer_expected=cat=='watch' and o.get('empty',0)>0)
         except Exception as e:note='err'+type(e).__name__
         if r is not None and r['n']>150 and max(r['length'],r['width'])<.25:
             # ring_yaw == radial direction (mod pi) -> closing along it, same convention as the minor-axis yaw
@@ -555,7 +572,7 @@ class Policy:
             lim=.03 if cat in ('wooden_toy',) else .05     # brown toys are weak in wood-chroma segmentation
             # the wrist segment must agree with the head footprint (partial segments of red bars / thin watch rings rejected)
             rl,rw=max(r['length'],r['width']),min(r['length'],r['width']);hl,hw=max(o['length'],o['width']),min(o['length'],o['width'])
-            plaus=.01<rw and rl<.14 and abs(np.log(rl/max(hl,.01)))<.4 and (cat=='watch' or abs(np.log(rw/max(hw,.008)))<.5)
+            plaus=.01<rw and rl<.14 and abs(np.log(rl/max(hl,.01)))<.4 and abs(np.log(rw/max(hw,.008)))<.5
             if shift<lim and plaus:
                 q=jaw_q(th);note=f'shift{shift:.3f}_dyaw{dyaw:.2f}_n{r["n"]}'
                 if (shift>.015 or dyaw>.35) and cmd['looks']<2:
@@ -619,7 +636,7 @@ class Policy:
             nearby=[v for v in self.det(obs) if np.hypot(v['x']-o['x'],v['y']-o['y'])<.055 and abs(v['length']-o['length'])<.045 and abs(v['sat']-o.get('sat',v['sat']))<.3 and abs(v['hole']-o.get('hole',v['hole']))<.25]
         if nearby:
             fresh=min(nearby,key=lambda v:np.hypot(v['x']-o['x'],v['y']-o['y'])+abs(v['sat']-o['sat'])*.1+abs(v['length']-o['length']))
-            o.update({k:fresh[k] for k in ('x','y','angle','height','gx','gy','ga','cx','cy','ch','body_ok')})
+            o.update({k:fresh[k] for k in GEOK})
         if o.get('staged') and not nearby:
             o['relay_unseen']=1   # keep the staging estimate; the wrist servo at hover re-locates it
         if arm is not None and self.assign_arm(o)!=arm:
@@ -645,22 +662,32 @@ class Policy:
             if self.tries[uid]>3:
                 o['skip']=True;o['taken']=True
                 return {'targets':{},'frames':1,'phase':f'give_up_id{uid}_tries{self.tries[uid]-1}'}
-        token=o.get('relay_in')
+        token=o.get('relay_in');restage=None
         if token:
             relay=self.relays[token]
             if relay['state']!='ready':
                 o['taken']=True;o['skip']=True
                 return {'targets':{},'frames':1,'phase':'relay_ineligible_'+token}
-            relay.update(state='receiving',receiver_arm=chosen,lift_ok=False);self.relay_event('receive',relay,'pickup_start')
+            if self.requires_relay(o,chosen):
+                if relay.get('restages',0)>=1:
+                    self.unresolved_relay(relay,'restage_exhausted')
+                    return {'targets':{},'frames':1,'phase':'relay_restage_exhausted_'+token}
+                restage=token;o.pop('relay_in')
+            else:
+                relay.update(state='receiving',receiver_arm=chosen,lift_ok=False);self.relay_event('receive',relay,'pickup_start')
         selected_arm=arm or self.assign_arm(o)
         self.relay_burst[selected_arm]=self.relay_burst[selected_arm]+1 if token else 0
         self.current=o
+        watch_grasps=[candidate for candidate in o.get('watch_grasps',[]) if np.linalg.norm(np.asarray(candidate[:2])-[o['x'],o['y']])<.075]
+        alternative_watch=o['cat']=='watch' and o.get('empty',0)>0 and len(watch_grasps)>1
+        if alternative_watch:
+            o['gx'],o['gy'],o['ga']=watch_grasps[min(o['empty'],len(watch_grasps)-1)]
         a='left' if o['x']<0 else 'right'
         if abs(o['x'])<BAND: a='left' if self.mapping[o['cat']] == 0 else 'right'
         if arm is not None:a=arm
         yaw=o['angle']%np.pi if o.get('shape')!='figure' else np.pi/2
         if o['cat']=='watch':yaw=o.get('ga',yaw)%np.pi
-        if o['cat'] in ('pepper','watch') and o.get('empty',0)%2==1:yaw=(yaw+np.pi/2)%np.pi
+        if o['cat'] in ('pepper','watch') and o.get('empty',0)%2==1 and not alternative_watch:yaw=(yaw+np.pi/2)%np.pi
         r=Rotation.from_euler('z',yaw)*Rotation.from_euler('y',np.pi/2)
         q0=r.as_quat(); q=[q0[3],*q0[:3]]
         x,y=o['x'],o['y']
@@ -682,18 +709,21 @@ class Policy:
             # staging y: most clearance from the other detected objects (prefer the free strip in front of the object field)
             others=[(v['x'],v['y']) for v in self.det(obs) if np.hypot(v['x']-o['x'],v['y']-o['y'])>.03]
             # v1d: also avoid relay spots already used by staged items the receiver has not picked yet (s2/35: 2 peppers on one spot)
-            others+=[(r['receiver']['x'],r['receiver']['y']) for r in self.relays.values() if r['state'] not in ('cancelled','consumed')]
+            others+=[(r['receiver']['x'],r['receiver']['y']) for r in self.relays.values() if r['state'] not in ('cancelled','consumed') and r['token']!=restage]
             def clear(yc):return min([np.hypot(px_-bx,py_-yc) for px_,py_ in others]+[1.])
             cands=[-.21,-.23,-.19,-.25]
             good=[yc for yc in cands if clear(yc)>.075]
             by=good[0] if good else max(cands,key=clear)
             st=self.add_item(dict(o,x=bx,y=by,gx=bx+o.get('gx',o['x'])-o['x'],gy=by+o.get('gy',o['y'])-o['y'],attempt=0,staged=True,ready=False,_new_receiver=True),front=True)
-            self.reserve_relay(o,st,a)
+            self.reserve_relay(o,st,a,reuse_token=restage)
         else:self.count[b]=k+1
         self.arm=a
         drop=grasp if staging else .965
         tilted=not staging and (b==1 or o.get('shape')=='compact')
         lift=1.055 if tilted else 1.025
+        far_pick=np.hypot(x-self.home[a][0],y+.45)>.42 and y>-.22
+        pick_lift=min(lift,1.015) if far_pick else lift
+        route_y=min(y,-.23) if far_pick else y
         pq=q;px=bx;py=by;pz=1.01 if staging else .995
         if tilted:
             pq=[.653281,-.270598,.270598,.653281]
@@ -712,7 +742,7 @@ class Policy:
             rotated=rot(pq)@rel
             px=px-rotated[0];py=.045-rotated[1]
             pz=float(np.clip(.905-rotated[2],.985,1.045));drop=pz
-        pivot_xyz=np.array([x,y,lift-.145])-rot(pq)@np.array([.145,0,0])
+        pivot_xyz=np.array([x,route_y,lift-.145])-rot(pq)@np.array([.145,0,0])
         corridor=[]
         if o['cat']=='car' and tilted:
             cy=min(y,-.20)
@@ -724,4 +754,19 @@ class Policy:
         if o['cat']=='car':
             tag+=f'_contact{x:.3f},{y:.3f},{grasp:.3f}_body{int(o.get("body_ok",False))}'
         self.queue=[self.command(a,[x,y,lift],q,preopen,18,tag+'_approach'),{'servo':True,'x':x,'y':y,'yaw':yaw,'q':q,'lift':lift,'preopen':preopen,'tag':tag,'looks':0},self.command(a,[x,y,grasp],q,preopen,14,tag+'_lower'),self.command(a,[x,y,grasp],q,0,12,tag+'_close'),self.command(a,[x,y,lift],q,0,16,tag+'_lift'),{'payload':'lift'},{'check_lift':True},*corridor,*([dict(self.command(a,pivot_xyz,pq,0,15,tag+'_rotate_clear'),pivot=True),{'payload':'rotate'},self.command(a,[pivot_xyz[0],pivot_xyz[1],pz],pq,0,12,tag+'_lower_clear')] if tilted else []),self.command(a,[px,py,pz],pq,0,22,tag+'_transfer'),{'payload':'transit'},self.command(a,[px,py,drop],pq,0,12,tag+'_drop_lower'),*([{'guard_release':True}] if tilted else []),dict(self.command(a,[px,py,drop],pq,1,10,tag+'_release'),**({'relay_release_token':o['relay_out']} if staging else {})),*([{'relay_commit':o['relay_out']}] if staging else []),self.command(a,[px,py-.13,drop] if o['cat']=='car' and tilted else [px,py,max(drop+.06,1.055)],pq,1,10,tag+('_backward_retreat' if o['cat']=='car' and tilted else '_vertical_retreat')),self.command(a,[self.home[a][0],-.35,1.02],self.pq[a],1,20,tag+'_home_clear'),*([{'basket_scan':True}] if o['cat']=='car' and tilted else [])]
+        if tilted:
+            for index,move in enumerate(self.queue):
+                if move.get('phase','').split('_clip')[0]==tag+'_vertical_retreat':
+                    self.queue[index]=self.command(a,[px,py-.13,drop],pq,1,10,tag+'_backward_retreat')
+        if far_pick:
+            for move in self.queue:
+                phase=move.get('phase','').split('_clip')[0]
+                if move.get('servo'):
+                    move['lift']=pick_lift
+                if phase in (tag+'_approach',tag+'_lift'):
+                    move['targets'][a+'_ee_pose'][2]=pick_lift
+            insertion=next(index for index,move in enumerate(self.queue) if move.get('check_lift'))+1
+            self.queue[insertion:insertion]=[
+                self.command(a,[x,route_y,pick_lift],q,0,15,tag+'_workspace_retreat'),
+                self.command(a,[x,route_y,lift],q,0,12,tag+'_workspace_raise')]
         return self.queue.pop(0)
